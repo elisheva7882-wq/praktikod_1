@@ -1,0 +1,272 @@
+﻿using System.CommandLine;
+using System.Text;
+
+Console.OutputEncoding = Encoding.UTF8;
+
+// שפה -> סיומות קבצים
+var extensions = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+{
+    ["c#"] = new[] { ".cs" },
+    ["java"] = new[] { ".java" },
+    ["python"] = new[] { ".py" },
+    ["javascript"] = new[] { ".js", ".jsx" },
+    ["typescript"] = new[] { ".ts", ".tsx" },
+    ["html"] = new[] { ".html" },
+    ["css"] = new[] { ".css" },
+    ["c"] = new[] { ".c", ".h" },
+    ["cpp"] = new[] { ".cpp", ".hpp" },
+};
+
+// תיקיות שלא נכללות ב-bundle
+var excludedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+{
+    "bin", "obj", "debug", "release", "publish", "node_modules", ".git", ".vs"
+};
+
+// ---------- אפשרויות ----------
+var outputOption = new Option<FileInfo>("--output", "-o")
+{
+    Description = "File path and name of the bundle (quote paths that contain spaces)",
+    Required = true
+};
+
+var languageOption = new Option<string[]>("--language", "-l")
+{
+    Description = "Programming languages to include, or 'all'",
+    Required = true,
+    AllowMultipleArgumentsPerToken = true
+};
+
+var noteOption = new Option<bool>("--note", "-n")
+{
+    Description = "Write the source file name and relative path as a comment"
+};
+
+var sortOption = new Option<string>("--sort", "-s")
+{
+    Description = "Order of the files: 'name' (default) or 'type'",
+    DefaultValueFactory = _ => "name"
+};
+
+var removeEmptyLinesOption = new Option<bool>("--remove-empty-lines", "-r")
+{
+    Description = "Remove empty lines from the source code"
+};
+
+var authorOption = new Option<string>("--author", "-a")
+{
+    Description = "Name of the author, written at the top of the bundle"
+};
+
+// ---------- פקודת bundle ----------
+var bundleCommand = new Command("bundle", "Bundle code files to a single file");
+bundleCommand.Options.Add(outputOption);
+bundleCommand.Options.Add(languageOption);
+bundleCommand.Options.Add(noteOption);
+bundleCommand.Options.Add(sortOption);
+bundleCommand.Options.Add(removeEmptyLinesOption);
+bundleCommand.Options.Add(authorOption);
+
+bundleCommand.SetAction(parseResult =>
+{
+    var output = parseResult.GetValue(outputOption)!;
+    var languages = parseResult.GetValue(languageOption)!;
+    var note = parseResult.GetValue(noteOption);
+    var sort = (parseResult.GetValue(sortOption) ?? "name").ToLower();
+    var removeEmpty = parseResult.GetValue(removeEmptyLinesOption);
+    var author = parseResult.GetValue(authorOption);
+
+    // ולידציה: sort
+    if (sort != "name" && sort != "type")
+    {
+        Console.WriteLine("Error: --sort must be 'name' or 'type'.");
+        return;
+    }
+
+    // ולידציה: שפות
+    var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    if (languages.Any(l => l.Equals("all", StringComparison.OrdinalIgnoreCase)))
+    {
+        foreach (var exts in extensions.Values)
+            foreach (var e in exts) allowed.Add(e);
+    }
+    else
+    {
+        foreach (var lang in languages)
+        {
+            if (!extensions.TryGetValue(lang, out var exts))
+            {
+                Console.WriteLine($"Error: unknown language '{lang}'. Supported: {string.Join(", ", extensions.Keys)}, all.");
+                return;
+            }
+            foreach (var e in exts) allowed.Add(e);
+        }
+    }
+
+    // ולידציה: ניתוב הפלט
+    var outputDir = output.DirectoryName;
+    if (string.IsNullOrEmpty(outputDir) || !Directory.Exists(outputDir))
+    {
+        Console.WriteLine("Error: the output path is invalid (directory does not exist).");
+        return;
+    }
+
+    var root = Directory.GetCurrentDirectory();
+
+    var files = Directory.GetFiles(root, "*", SearchOption.AllDirectories)
+        .Where(f => allowed.Contains(Path.GetExtension(f)))
+        .Where(f => !Path.GetRelativePath(root, f)
+                        .Split(Path.DirectorySeparatorChar)
+                        .SkipLast(1)
+                        .Any(dir => excludedDirs.Contains(dir)))
+        .Where(f => !string.Equals(Path.GetFullPath(f), output.FullName, StringComparison.OrdinalIgnoreCase));
+
+    files = sort == "type"
+        ? files.OrderBy(f => Path.GetExtension(f), StringComparer.OrdinalIgnoreCase)
+               .ThenBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+        : files.OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase);
+
+    var fileList = files.ToList();
+
+    try
+    {
+        using var writer = new StreamWriter(output.FullName, false, Encoding.UTF8);
+
+        if (!string.IsNullOrWhiteSpace(author))
+            writer.WriteLine($"// Author: {author}");
+
+        foreach (var file in fileList)
+        {
+            if (note)
+                writer.WriteLine($"// Source: {Path.GetFileName(file)} ({Path.GetRelativePath(root, file)})");
+
+            var lines = File.ReadAllLines(file);
+            if (removeEmpty)
+                lines = lines.Where(l => !string.IsNullOrWhiteSpace(l)).ToArray();
+
+            foreach (var line in lines)
+                writer.WriteLine(line);
+
+            writer.WriteLine();
+        }
+
+        Console.WriteLine($"File was created ({fileList.Count} files bundled)");
+    }
+    catch (DirectoryNotFoundException)
+    {
+        Console.WriteLine("Error: the output path is invalid.");
+    }
+    catch (UnauthorizedAccessException)
+    {
+        Console.WriteLine("Error: no permission to write to this path.");
+    }
+    catch (IOException ex)
+    {
+        Console.WriteLine($"Error: could not write the file ({ex.Message}).");
+    }
+});
+
+// ---------- פקודת create-rsp ----------
+var createRspCommand = new Command("create-rsp", "Create a response file with a ready bundle command");
+
+createRspCommand.SetAction(_ =>
+{
+    // output
+    string outputPath;
+    while (true)
+    {
+        Console.Write("Output file name or full path (--output): ");
+        outputPath = (Console.ReadLine() ?? "").Trim().Trim('"');
+        if (outputPath.Length == 0) { Console.WriteLine("Output is required."); continue; }
+        var dir = Path.GetDirectoryName(Path.GetFullPath(outputPath));
+        if (dir == null || !Directory.Exists(dir)) { Console.WriteLine("The path is invalid, try again."); continue; }
+        break;
+    }
+
+    // language
+    string[] langs;
+    while (true)
+    {
+        Console.Write($"Languages separated by spaces, or 'all' (--language) [{string.Join(", ", extensions.Keys)}]: ");
+        langs = (Console.ReadLine() ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (langs.Length == 0) { Console.WriteLine("Language is required."); continue; }
+        var bad = langs.FirstOrDefault(l => !l.Equals("all", StringComparison.OrdinalIgnoreCase) && !extensions.ContainsKey(l));
+        if (bad != null) { Console.WriteLine($"Unknown language '{bad}', try again."); continue; }
+        break;
+    }
+
+    // note
+    bool note = AskYesNo("Write the source of each file as a comment? (--note) [y/n]: ");
+
+    // sort
+    string sort;
+    while (true)
+    {
+        Console.Write("Sort by 'name' or 'type'? (--sort) [Enter = name]: ");
+        sort = (Console.ReadLine() ?? "").Trim().ToLower();
+        if (sort == "") sort = "name";
+        if (sort == "name" || sort == "type") break;
+        Console.WriteLine("Please type 'name' or 'type'.");
+    }
+
+    // remove-empty-lines
+    bool removeEmpty = AskYesNo("Remove empty lines? (--remove-empty-lines) [y/n]: ");
+
+    // author
+    Console.Write("Author name (--author) [Enter to skip]: ");
+    var author = (Console.ReadLine() ?? "").Trim();
+
+    // בניית הפקודה
+    var sb = new StringBuilder("bundle");
+    sb.Append($" --output {Quote(outputPath)}");
+    sb.Append($" --language {string.Join(" ", langs)}");
+    if (note) sb.Append(" --note");
+    sb.Append($" --sort {sort}");
+    if (removeEmpty) sb.Append(" --remove-empty-lines");
+    if (author.Length > 0) sb.Append($" --author {Quote(author)}");
+
+    // שמירת קובץ התגובה
+    string rspName;
+    while (true)
+    {
+        Console.Write("Response file name [Enter = bundle.rsp]: ");
+        rspName = (Console.ReadLine() ?? "").Trim().Trim('"');
+        if (rspName == "") rspName = "bundle.rsp";
+        if (!rspName.EndsWith(".rsp", StringComparison.OrdinalIgnoreCase)) rspName += ".rsp";
+        break;
+    }
+
+    try
+    {
+        File.WriteAllText(rspName, sb.ToString());
+        Console.WriteLine($"Response file created: {Path.GetFullPath(rspName)}");
+        Console.WriteLine($"Run it with:  cli @{rspName}");
+    }
+    catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+    {
+        Console.WriteLine($"Error: could not create the response file ({ex.Message}).");
+    }
+});
+
+// ---------- פקודת השורש ----------
+var rootCommand = new RootCommand("Root command for File Bundler CLI");
+rootCommand.Subcommands.Add(bundleCommand);
+rootCommand.Subcommands.Add(createRspCommand);
+
+return rootCommand.Parse(args).Invoke();
+
+// ---------- פונקציות עזר ----------
+static bool AskYesNo(string question)
+{
+    while (true)
+    {
+        Console.Write(question);
+        var answer = (Console.ReadLine() ?? "").Trim().ToLower();
+        if (answer is "y" or "yes") return true;
+        if (answer is "n" or "no") return false;
+        Console.WriteLine("Please answer y or n.");
+    }
+}
+
+static string Quote(string value) => value.Contains(' ') ? $"\"{value}\"" : value;
+
